@@ -57,10 +57,12 @@ def log(msg):
     line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
     try:
-        if LOG and os.path.getsize(LOG) > 5 * 1024 * 1024:
+        if LOG and os.path.isfile(LOG) and os.path.getsize(LOG) > 5 * 1024 * 1024:
             shutil.move(LOG, LOG + ".1")
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        if LOG:
+            fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except Exception:
         pass
 
@@ -83,19 +85,23 @@ def load_config(path):
     for p in (STATE, LOG):
         d = os.path.dirname(p)
         if d:
-            os.makedirs(d, exist_ok=True)
+            os.makedirs(d, mode=0o700, exist_ok=True)
 
 
 def curl_json(path, method="GET", timeout=60, files=None):
     cmd = ["/usr/bin/curl", "-s", "-m", str(timeout), "-X", method]
     pwd = str(CFG.get("web_password") or "")
+    stdin_cfg = None
     if pwd:
-        cmd += ["-u", "%s:%s" % (CFG.get("web_user", "admin"), pwd)]
+        user = str(CFG.get("web_user", "admin"))
+        escaped = ("%s:%s" % (user, pwd)).replace("\\", "\\\\").replace('"', '\\"')
+        stdin_cfg = 'user = "%s"\n' % escaped
+        cmd += ["-K", "-"]
     cmd += ["-w", "\n%{http_code}", ESP + path]
     if files:
         for f in files:
             cmd += ["-F", "file=@" + f]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, input=stdin_cfg, capture_output=True, text=True)
     out = r.stdout.rsplit("\n", 1)
     body = out[0] if len(out) > 1 else ""
     code = out[-1].strip()
@@ -286,6 +292,50 @@ def set_exif_orientation(path, value=1):
     return False
 
 
+def strip_jpeg_metadata(path):
+    """Remove APP1..APP15 (EXIF/GPS/XMP/ICC) and COM segments from a JPEG."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except Exception:
+        return False
+    if data[:2] != b"\xff\xd8":
+        return False
+    out = bytearray(b"\xff\xd8")
+    i = 2
+    n = len(data)
+    while i + 2 <= n:
+        if data[i] != 0xFF:
+            return False
+        while i < n and data[i] == 0xFF:
+            i += 1
+        if i >= n:
+            break
+        m = data[i]
+        i += 1
+        if m == 0xD9:
+            out += b"\xff\xd9"
+            break
+        if m in (0xD8, 0x01) or (0xD0 <= m <= 0xD7):
+            out += bytes((0xFF, m))
+            continue
+        if i + 2 > n:
+            return False
+        ln = int.from_bytes(data[i:i + 2], "big")
+        if ln < 2 or i + ln > n:
+            return False
+        if m == 0xDA:
+            out += bytes((0xFF, m)) + data[i:]
+            break
+        # Drop APP1..APP15 (0xE1..0xEF) and COM (0xFE); keep APP0 (JFIF) and image tables
+        if not (0xE1 <= m <= 0xEF or m == 0xFE):
+            out += bytes((0xFF, m)) + data[i:i + ln]
+        i += ln
+    with open(path, "wb") as fh:
+        fh.write(out)
+    return True
+
+
 def image_size(path):
     r = subprocess.run(["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", path],
                        capture_output=True, text=True)
@@ -337,7 +387,7 @@ def convert(src, dst):
     # Letterbox to the frame's native size instead of distorting.
     subprocess.run(["/usr/bin/sips", "-p", str(H), str(W),
                     "--padColor", "000000", dst], capture_output=True)
-    set_exif_orientation(dst, 1)
+    strip_jpeg_metadata(dst)
     return True, w, h
 
 
@@ -366,7 +416,8 @@ def load_state():
 
 def save_state(st):
     tmp = STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE)
 

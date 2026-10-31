@@ -1,0 +1,24 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Secrets and local config - NEVER commit these
+include/secrets.h
+include/secrets.h.bak.*
+secrets.h
+tools/config.json
+*.local.json
+
+# Runtime state
+state/
+*.log
+*.log.1
+
+# macOS
+.DS_Store
+._*
+
+# Editors
+.vscode/
+.idea/

@@ -1,0 +1,15 @@
+{
+  "device_url": "http://photo-frame.local",
+  "web_user": "admin",
+  "web_password": "",
+  "photos_library": "~/Pictures/Photos Library.photoslibrary",
+  "people": {},
+  "max_per_person": 12,
+  "max_days": 730,
+  "keep_on_card": 90,
+  "jpeg_quality": "70",
+  "width": 800,
+  "height": 600,
+  "state_file": "~/.local/state/esp32-photo-bridge/state.json",
+  "log_file": "~/.local/state/esp32-photo-bridge/sync.log"
+}

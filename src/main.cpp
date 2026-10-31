@@ -70,6 +70,7 @@ static volatile bool uploadingActive = false;
 static volatile bool batchActive = false;
 static volatile int uploadRejectCode = 0;   // 0 = accepted, 401 = auth, 503 = card
 static volatile bool otaRejected = false;
+static volatile bool otaStarted = false;
 static volatile uint32_t lastUploadActivityMs = 0;
 static uint64_t sdTotalMB = 0;
 static uint64_t sdUsedMB = 0;
@@ -152,14 +153,22 @@ static bool flushAndRemountSd() {
 
 // ---------- USB MSC ----------
 static int32_t onUsbRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-  if (!sdCard || !usbMscMounted) return -1;
+  if (!sdCard || !usbMscMounted || !buffer || bufsize == 0) return -1;
   uint32_t secSize = sdCard->csd.sector_size ? sdCard->csd.sector_size : 512;
+  uint32_t secCap = sdCard->csd.capacity;
+  if (lba >= secCap) return -1;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) return -1;
   esp_err_t err = ESP_OK;
   if (offset == 0 && (bufsize % secSize == 0)) {
-    err = sdmmc_read_sectors(sdCard, buffer, lba, bufsize / secSize);
+    uint32_t nSec = bufsize / secSize;
+    if (nSec > secCap - lba) { xSemaphoreGive(sdMutex); return -1; }
+    err = sdmmc_read_sectors(sdCard, buffer, lba, nSec);
   } else {
     uint8_t tmp[512];
+    if (secSize > sizeof(tmp) || offset >= secSize || bufsize > secSize - offset) {
+      xSemaphoreGive(sdMutex);
+      return -1;
+    }
     err = sdmmc_read_sectors(sdCard, tmp, lba, 1);
     if (err == ESP_OK) memcpy(buffer, tmp + offset, bufsize);
   }
@@ -168,17 +177,25 @@ static int32_t onUsbRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t b
 }
 
 static int32_t onUsbWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
-  if (!sdCard || !usbMscMounted) return -1;
+  if (!sdCard || !usbMscMounted || !buffer || bufsize == 0) return -1;
   // Read-only mode: pretend the write succeeded, then drop it.  The host stays
   // happy, the card stays clean, and FatFs' cache stays authoritative.
   if (usbReadOnly) return (int32_t)bufsize;
   uint32_t secSize = sdCard->csd.sector_size ? sdCard->csd.sector_size : 512;
+  uint32_t secCap = sdCard->csd.capacity;
+  if (lba >= secCap) return -1;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(1500)) != pdTRUE) return -1;
   esp_err_t err = ESP_OK;
   if (offset == 0 && (bufsize % secSize == 0)) {
-    err = sdmmc_write_sectors(sdCard, buffer, lba, bufsize / secSize);
+    uint32_t nSec = bufsize / secSize;
+    if (nSec > secCap - lba) { xSemaphoreGive(sdMutex); return -1; }
+    err = sdmmc_write_sectors(sdCard, buffer, lba, nSec);
   } else {
     uint8_t tmp[512];
+    if (secSize > sizeof(tmp) || offset >= secSize || bufsize > secSize - offset) {
+      xSemaphoreGive(sdMutex);
+      return -1;
+    }
     err = sdmmc_read_sectors(sdCard, tmp, lba, 1);
     if (err == ESP_OK) {
       memcpy(tmp + offset, buffer, bufsize);
@@ -380,7 +397,27 @@ async function loadFiles(){
   tb.innerHTML = '';
   for(const f of d.files){
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td><a href="/view?name=${encodeURIComponent(f.name)}" target="_blank" style="color:#38bdf8">${f.name}</a></td><td>${(f.size/1024).toFixed(1)} KB</td><td><button class="btn red" onclick="delFile('${f.name}')">Delete</button></td>`;
+    const tdName = document.createElement('td');
+    const a = document.createElement('a');
+    a.href = '/view?name=' + encodeURIComponent(f.name);
+    a.target = '_blank';
+    a.style.color = '#38bdf8';
+    a.textContent = f.name;
+    tdName.appendChild(a);
+
+    const tdSize = document.createElement('td');
+    tdSize.textContent = (f.size / 1024).toFixed(1) + ' KB';
+
+    const tdAct = document.createElement('td');
+    const btn = document.createElement('button');
+    btn.className = 'btn red';
+    btn.textContent = 'Delete';
+    btn.addEventListener('click', () => delFile(f.name));
+    tdAct.appendChild(btn);
+
+    tr.appendChild(tdName);
+    tr.appendChild(tdSize);
+    tr.appendChild(tdAct);
     tb.appendChild(tr);
   }
 }
@@ -869,21 +906,36 @@ void setup() {
   server.on("/mount", HTTP_POST, handleMount);
   server.on("/status", HTTP_GET, handleHttpStatus);
   server.on("/ota", HTTP_POST, []() {
-    if (otaRejected) { otaRejected = false; server.requestAuthentication(); return; }
-    bool ok = !Update.hasError();
-    server.send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    if (strlen(WEB_PASS) == 0) {
+      otaRejected = false;
+      otaStarted = false;
+      server.send(403, "application/json", "{\"ok\":false,\"error\":\"set WEB_PASS to enable OTA\"}");
+      return;
+    }
+    if (otaRejected || !requireAuth()) {
+      otaRejected = false;
+      otaStarted = false;
+      if (otaRejected) server.requestAuthentication();
+      return;
+    }
+    bool ok = otaStarted && !Update.hasError() && Update.isFinished();
+    otaStarted = false;
+    server.send(ok ? 200 : 400, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
     delay(300);
     if (ok) ESP.restart();
   }, []() {
     HTTPUpload& up = server.upload();
     if (up.status == UPLOAD_FILE_START) {
-      if (!webAuthOk()) { otaRejected = true; return; }
+      otaRejected = false;
+      otaStarted = false;
+      if (strlen(WEB_PASS) == 0 || !webAuthOk()) { otaRejected = true; return; }
       uploadingActive = true;
-      Update.begin(UPDATE_SIZE_UNKNOWN);
+      if (Update.begin(UPDATE_SIZE_UNKNOWN)) otaStarted = true;
     } else if (up.status == UPLOAD_FILE_WRITE) {
-      if (!otaRejected) Update.write(up.buf, up.currentSize);
-    } else if (up.status == UPLOAD_FILE_END) {
-      if (!otaRejected) Update.end(true);
+      if (!otaRejected && otaStarted) Update.write(up.buf, up.currentSize);
+    } else if (up.status == UPLOAD_FILE_END || up.status == UPLOAD_FILE_ABORTED) {
+      if (!otaRejected && otaStarted && up.status == UPLOAD_FILE_END) Update.end(true);
+      else if (otaStarted) Update.abort();
       uploadingActive = false;
     }
   });
